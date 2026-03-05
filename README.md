@@ -25,6 +25,8 @@ The main idea is to avoid needing to switch over to a browser or a heavier CLI t
 
 ## Auth
 
+Currently the intended seamless usage expects having Codex CLI authed. 
+
 Backends:
 
 - `codex` (recommended for least friction): uses your local Codex login session
@@ -45,7 +47,7 @@ ais [options] [prompt words...]
 
 Common examples:
 
-```bash
+```
 ais how do I split windows in nvim?
 
 cat myfile.txt | ais -p "summarize this"
