@@ -1,6 +1,6 @@
 # ais
 
-Fast terminal AI assistant for command-line workflows.
+Fast terminal AI search for command-line workflows.
 
 Install (Linux/macOS):
 
@@ -15,6 +15,8 @@ curl -fsSL https://raw.githubusercontent.com/sqmch/ais/main/scripts/uninstall.sh
 ```
 
 ## What it does
+
+The main idea is to avoid needing to switch over to a browser or a heavier CLI tool to prompt AI with some questions or data processing needs.
 
 - Ask directly from terminal: `ais explain awk vs sed`
 - Pipe command output: `ls -la 2>&1 | ais -p "explain issues"`
