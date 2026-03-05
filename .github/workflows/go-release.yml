@@ -1,0 +1,53 @@
+name: go-release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          platforms=(
+            "linux amd64"
+            "linux arm64"
+            "darwin amd64"
+            "darwin arm64"
+          )
+
+          for p in "${platforms[@]}"; do
+            read -r os arch <<<"$p"
+            outdir="$(mktemp -d)"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -o "$outdir/ais" ./cmd/ais
+            tar -C "$outdir" -czf "dist/ais_${os}_${arch}.tar.gz" ais
+            rm -rf "$outdir"
+          done
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum ais_*.tar.gz > checksums.txt
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/ais_*.tar.gz
+            dist/checksums.txt
