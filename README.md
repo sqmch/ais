@@ -24,7 +24,7 @@ curl -fsSL https://raw.githubusercontent.com/sqmch/ais/main/scripts/uninstall.sh
 
 ## Quick Use
 
-```bash
+```
 ais how do I split windows in nvim?
 git diff | ais -p "summarize risk and test impact"
 cat file.txt | ais -p "summarize"
@@ -40,7 +40,7 @@ Set a remembered default backend/model:
 ais --configure
 ```
 
-The picker supports arrow keys, `j`/`k`, number shortcuts, and saves to `~/.config/ais/config.json`.
+The picker saves to `~/.config/ais/config.json`.
 
 Useful flags:
 
