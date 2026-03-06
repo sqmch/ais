@@ -1,8 +1,16 @@
 # ais
 
-Fast terminal AI search for command-line workflows.
+Tiny terminal AI helper for quick command-line questions and summaries.
 
-Install (Linux/macOS):
+It exists for the small stuff: quick shell questions, pasted output, diff summaries, and "what is this error?" moments without opening a browser or a full chat app.
+
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sqmch/ais/main/scripts/install.sh | sh
+```
+
+Update:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sqmch/ais/main/scripts/install.sh | sh
@@ -14,80 +22,77 @@ Uninstall:
 curl -fsSL https://raw.githubusercontent.com/sqmch/ais/main/scripts/uninstall.sh | sh
 ```
 
-## What it does
+## Quick Use
 
-The main idea is to avoid needing to switch over to a browser or a heavier CLI tool to prompt AI with some questions or data processing needs.
+```bash
+ais how do I split windows in nvim?
+git diff | ais -p "summarize risk and test impact"
+cat file.txt | ais -p "summarize"
+ls -la 2>&1 | ais -p "explain what's wrong"
+curl -Ls https://example.com | ais -p "extract the key points"
+```
 
-- Ask directly from terminal: `ais explain awk vs sed`
-- Pipe command output: `ls -la 2>&1 | ais -p "explain issues"`
-- Pipe files/web content: `cat file.txt | ais -p "summarize"`
-- Uses existing `codex login` (default path) or API key fallback.
+## Configure
 
-## Auth
+Set a remembered default backend/model:
 
-Currently the intended seamless usage expects having Codex CLI authed. 
+```bash
+ais --configure
+```
 
-Backends:
+The picker supports arrow keys, `j`/`k`, number shortcuts, and saves to `~/.config/ais/config.json`.
 
-- `codex` (recommended for least friction): uses your local Codex login session
+Useful flags:
+
+- `-p, --prompt`
+- `-b, --backend` = `auto|codex|api|oss`
+- `-m, --model`
+- `--local-provider` = `ollama|lmstudio`
+- `--configure`
+- `--list-models`
+- `--stream` / `--no-stream`
+- `--version`
+
+Saved defaults are used automatically. Flags and env vars still override them for one-off runs.
+
+Quick examples:
+
+```bash
+ais --configure
+ais --backend codex --list-models
+ais --backend oss --local-provider ollama --model qwen2.5-coder:7b "explain this error"
+```
+
+## Backends
+
+- `codex`: uses your local `codex login`
 - `api`: uses `OPENAI_API_KEY`
-- `auto` (default): prefers logged-in codex, then API
+- `oss`: uses `codex --oss` with Ollama or LM Studio
+- `auto`: prefers logged-in Codex, then API
 
-First-time codex setup:
+First-time Codex setup:
 
 ```bash
 codex login
 ```
 
-## Usage
-
-```bash
-ais [options] [prompt words...]
-```
-
-Common examples:
-
-```
-ais how do I split windows in nvim?
-
-cat myfile.txt | ais -p "summarize this"
-
-curl -Ls https://example.com | ais -p "extract key points"
-
-git diff | ais -p "summarize risk and test impact"
-```
-
-Useful options:
-
-- `-p, --prompt`: explicit instruction text (great with pipes)
-- `-b, --backend`: `auto`, `codex`, `api`
-- `--stream` / `--no-stream`
-- `--max-input-chars`
-- `--truncate head|tail|middle`
-- `--show-input-stats`
-- `--no-spinner`
-- `--render auto|ansi|raw`
-
-## Install details
-
-The installer script:
-
-- detects OS/arch
-- downloads matching release artifact from GitHub Releases
-- verifies SHA256 checksums
-- installs `ais` into:
-  - `~/.local/bin` (default user install)
-  - `/usr/local/bin` (if run as root)
-
-Optional install env vars:
-
-- `AIS_VERSION` (example: `v0.1.0`)
-- `AIS_INSTALL_DIR`
-- `AIS_BIN_NAME`
-
-## Build from source
+## Build
 
 ```bash
 go build -o ais ./cmd/ais
 ./ais --help
 ```
+
+## Install Notes
+
+The installer:
+
+- downloads the latest GitHub release by default
+- verifies SHA256 checksums
+- installs to `~/.local/bin` by default, or `/usr/local/bin` as root
+
+Optional env vars:
+
+- `AIS_VERSION`
+- `AIS_INSTALL_DIR`
+- `AIS_BIN_NAME`
