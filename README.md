@@ -4,6 +4,9 @@ Tiny terminal AI helper for quick command-line questions and summaries.
 
 It exists for the small stuff: quick shell questions, pasted output, diff summaries, and "what is this error?" moments without opening a browser or a full chat app.
 
+<img width="1011" height="276" alt="image" src="https://github.com/user-attachments/assets/39638a46-058a-40f3-a420-3f9bbbf0e147" />
+
+
 ## Install
 
 ```bash
