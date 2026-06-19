@@ -9,21 +9,35 @@ It exists for the small stuff: quick shell questions, pasted output, diff summar
 
 ## Install
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/sqmch/ais/main/scripts/install.sh | sh
-```
-
-Update:
+### Linux / macOS
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sqmch/ais/main/scripts/install.sh | sh
 ```
 
-Uninstall:
+Update (re-run the installer) / Uninstall:
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/sqmch/ais/main/scripts/install.sh | sh
 curl -fsSL https://raw.githubusercontent.com/sqmch/ais/main/scripts/uninstall.sh | sh
 ```
+
+### Windows (PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/sqmch/ais/main/scripts/install.ps1 | iex
+```
+
+Update (re-run the installer) / Uninstall:
+
+```powershell
+irm https://raw.githubusercontent.com/sqmch/ais/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/sqmch/ais/main/scripts/uninstall.ps1 | iex
+```
+
+`ais` is a single self-contained executable — no Go, Node, or other runtime is
+needed to run it. The installer drops `ais.exe` in `%LOCALAPPDATA%\Programs\ais`
+and adds it to your user PATH; open a new terminal afterwards.
 
 ## Quick Use
 
@@ -86,15 +100,23 @@ go build -o ais ./cmd/ais
 ./ais --help
 ```
 
+On Windows (PowerShell):
+
+```powershell
+go build -o ais.exe ./cmd/ais
+.\ais.exe --help
+```
+
 ## Install Notes
 
 The installer:
 
 - downloads the latest GitHub release by default
 - verifies SHA256 checksums
-- installs to `~/.local/bin` by default, or `/usr/local/bin` as root
+- installs to `~/.local/bin` by default, or `/usr/local/bin` as root (Linux/macOS),
+  or `%LOCALAPPDATA%\Programs\ais` on Windows
 
-Optional env vars:
+Optional env vars (both installers):
 
 - `AIS_VERSION`
 - `AIS_INSTALL_DIR`

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -29,7 +30,7 @@ const (
 	defaultSystemPrompt  = "You are a practical terminal assistant. Keep answers concise and clear. Use short sections and bullets where useful. Avoid markdown tables."
 	defaultMaxInputChars = 120000
 	defaultTruncateMode  = "head"
-	version              = "0.2.0"
+	version              = "0.3.0"
 )
 
 const (
@@ -1063,11 +1064,11 @@ func printModelCatalog(cfg Config, backend string, out io.Writer) {
 }
 
 func readCodexConfigModel() string {
-	path := os.Getenv("HOME")
-	if path == "" {
+	home := homeDir()
+	if home == "" {
 		return ""
 	}
-	b, err := os.ReadFile(path + "/.codex/config.toml")
+	b, err := os.ReadFile(filepath.Join(home, ".codex", "config.toml"))
 	if err != nil {
 		return ""
 	}
@@ -1195,7 +1196,7 @@ func runConfigure(cfg Config, in io.Reader, out io.Writer, errOut io.Writer) err
 }
 
 func chooseOption(reader *bufio.Reader, inFile *os.File, outFile *os.File, out io.Writer, label string, options []string, current string) (string, error) {
-	if inFile != nil && outFile != nil && readerIsTTY(inFile) && writerIsTTY(outFile) {
+	if interactiveSelectSupported && inFile != nil && outFile != nil && readerIsTTY(inFile) && writerIsTTY(outFile) {
 		return chooseOptionInteractive(inFile, outFile, label, options, current)
 	}
 	fmt.Fprintf(out, "%s:\n", label)
@@ -1320,31 +1321,6 @@ func chooseOptionInteractive(inFile *os.File, outFile *os.File, label string, op
 	}
 }
 
-func enterSelectMode(inFile *os.File) (func(), error) {
-	stateCmd := exec.Command("stty", "-g")
-	stateCmd.Stdin = inFile
-	state, err := stateCmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read terminal state: %w", err)
-	}
-	orig := strings.TrimSpace(string(state))
-
-	// Disable canonical mode so arrow keys and single-digit picks are read immediately,
-	// but keep normal output processing so line rendering stays aligned in terminals.
-	modeCmd := exec.Command("stty", "-icanon", "-echo", "min", "1", "time", "0")
-	modeCmd.Stdin = inFile
-	if err := modeCmd.Run(); err != nil {
-		return nil, fmt.Errorf("failed to enter selection mode: %w", err)
-	}
-
-	restore := func() {
-		restoreCmd := exec.Command("stty", orig)
-		restoreCmd.Stdin = inFile
-		_ = restoreCmd.Run()
-	}
-	return restore, nil
-}
-
 func promptLine(reader *bufio.Reader, out io.Writer, label string, current string) (string, error) {
 	if current != "" {
 		fmt.Fprintf(out, "%s [%s]: ", label, current)
@@ -1395,7 +1371,7 @@ func saveConfig(cfg SavedConfig) error {
 	if path == "" {
 		return fmt.Errorf("could not determine config path")
 	}
-	dir := path[:strings.LastIndex(path, "/")]
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
@@ -1409,13 +1385,23 @@ func saveConfig(cfg SavedConfig) error {
 
 func configPath() string {
 	if xdg := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); xdg != "" {
-		return xdg + "/ais/config.json"
+		return filepath.Join(xdg, "ais", "config.json")
 	}
-	home := strings.TrimSpace(os.Getenv("HOME"))
+	home := homeDir()
 	if home == "" {
 		return ""
 	}
-	return home + "/.config/ais/config.json"
+	return filepath.Join(home, ".config", "ais", "config.json")
+}
+
+// homeDir returns the current user's home directory in an OS-appropriate way
+// ($HOME on Unix, %USERPROFILE% on Windows), or "" if it cannot be resolved.
+func homeDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(home)
 }
 
 func ansi(text string, styles ...string) string {
