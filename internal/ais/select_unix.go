@@ -38,3 +38,43 @@ func enterSelectMode(inFile *os.File) (func(), error) {
 	}
 	return restore, nil
 }
+
+// readSelectKey reads one logical keypress in raw mode. Arrow keys arrive as the
+// ANSI escape sequences ESC [ A / ESC [ B; j/k mirror them; Enter confirms.
+func readSelectKey(inFile *os.File) (selectKey, error) {
+	buf := make([]byte, 3)
+	n, err := inFile.Read(buf[:1])
+	if err != nil {
+		return selectKey{}, err
+	}
+	if n == 0 {
+		return selectKey{kind: selectKeyNone}, nil
+	}
+	switch buf[0] {
+	case '\r', '\n':
+		return selectKey{kind: selectKeyEnter}, nil
+	case 'k':
+		return selectKey{kind: selectKeyUp}, nil
+	case 'j':
+		return selectKey{kind: selectKeyDown}, nil
+	case 27: // ESC: possibly the start of an arrow-key sequence.
+		m, err := inFile.Read(buf[1:3])
+		if err != nil {
+			return selectKey{}, err
+		}
+		if m >= 2 && buf[1] == '[' {
+			switch buf[2] {
+			case 'A':
+				return selectKey{kind: selectKeyUp}, nil
+			case 'B':
+				return selectKey{kind: selectKeyDown}, nil
+			}
+		}
+		return selectKey{kind: selectKeyCancel}, nil
+	default:
+		if buf[0] >= '1' && buf[0] <= '9' {
+			return selectKey{kind: selectKeyDigit, digit: int(buf[0] - '0')}, nil
+		}
+	}
+	return selectKey{kind: selectKeyNone}, nil
+}

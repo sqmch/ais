@@ -27,10 +27,11 @@ const (
 	defaultAPIModel      = "gpt-4.1-mini"
 	defaultBackend       = "auto"
 	defaultRenderMode    = "auto"
-	defaultSystemPrompt  = "You are a practical terminal assistant. Keep answers concise and clear. Use short sections and bullets where useful. Avoid markdown tables."
+	defaultSystemPrompt  = "You are a practical terminal assistant. Answer the user's question or request directly and immediately; never ask what they want to work on or offer to start a task. Keep answers concise and clear. Use short sections and bullets where useful. Avoid markdown tables."
 	defaultMaxInputChars = 120000
 	defaultTruncateMode  = "head"
-	version              = "0.3.0"
+	defaultReasoning     = "low"
+	version              = "0.4.0"
 )
 
 const (
@@ -61,12 +62,17 @@ type Config struct {
 	ListModels      bool
 	Configure       bool
 	ShowVersion     bool
+	Agent           bool
+	AssumeYes       bool
+	ReasoningEffort string
+	ModelExplicit   bool
 }
 
 type SavedConfig struct {
-	Backend       string `json:"backend,omitempty"`
-	Model         string `json:"model,omitempty"`
-	LocalProvider string `json:"local_provider,omitempty"`
+	Backend         string `json:"backend,omitempty"`
+	Model           string `json:"model,omitempty"`
+	LocalProvider   string `json:"local_provider,omitempty"`
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
 type InputStats struct {
@@ -95,6 +101,10 @@ func Run(args []string, in io.Reader, out io.Writer, errOut io.Writer) int {
 
 	if cfg.Configure {
 		if err := runConfigure(cfg, in, out, errOut); err != nil {
+			if errors.Is(err, errSelectCancelled) {
+				fmt.Fprintln(out, "Configuration cancelled.")
+				return 0
+			}
 			fmt.Fprintln(errOut, err.Error())
 			return 1
 		}
@@ -108,6 +118,28 @@ func Run(args []string, in io.Reader, out io.Writer, errOut io.Writer) int {
 		}
 		printModelCatalog(cfg, backend, out)
 		return 0
+	}
+
+	// Routing: on the Codex backend, an interactive request (no piped stdin) is
+	// classified locally — an action ("kill the server on port 8080") goes to the
+	// agent path that proposes and runs commands; a question goes to the classic
+	// Q&A path below. `-a` forces the action path. Piped input (summaries) and
+	// non-Codex backends always use the classic Q&A path.
+	stdinPiped := !readerIsTTY(in)
+	if cfg.Agent || (!stdinPiped && resolveBackend(cfg.Backend) == "codex") {
+		if resolveBackend(cfg.Backend) != "codex" {
+			fmt.Fprintln(errOut, "Running commands (-a) requires the Codex backend.")
+			return 2
+		}
+		task := joinTask(cfg)
+		if cfg.Agent || looksLikeCommand(task) {
+			return runAgent(cfg, task, in, out, errOut)
+		}
+		// A question on the Codex backend: use the structured Q&A path, which is
+		// far more reliable than free-form prompting of codex exec.
+		if task != "" {
+			return runCodexQA(cfg, task, out, errOut)
+		}
 	}
 
 	prompt, stats, err := buildPrompt(cfg, in)
@@ -217,6 +249,7 @@ func parseArgs(args []string, errOut io.Writer) (Config, error) {
 		Stream:          envBool("AIS_STREAM", true),
 		MaxInputChars:   envInt("AIS_MAX_INPUT_CHARS", defaultMaxInputChars),
 		TruncateMode:    envOr("AIS_TRUNCATE", defaultTruncateMode),
+		ReasoningEffort: firstNonEmpty(os.Getenv("AIS_REASONING_EFFORT"), firstNonEmpty(saved.ReasoningEffort, defaultReasoning)),
 	}
 
 	fs := flag.NewFlagSet("ais", flag.ContinueOnError)
@@ -244,6 +277,12 @@ func parseArgs(args []string, errOut io.Writer) (Config, error) {
 	fs.BoolVar(&cfg.ListModels, "list-models", false, "List practical model choices for the selected backend and exit.")
 	fs.BoolVar(&cfg.Configure, "configure", false, "Open an interactive default backend/model picker and save the result.")
 	fs.BoolVar(&cfg.ShowVersion, "version", false, "Show version and exit.")
+	fs.BoolVar(&cfg.Agent, "a", false, "Agent mode: let ais run shell commands to accomplish a task (asks before each).")
+	fs.BoolVar(&cfg.Agent, "agent", false, "Agent mode: let ais run shell commands to accomplish a task (asks before each).")
+	fs.BoolVar(&cfg.AssumeYes, "y", false, "In agent mode, run proposed commands without asking for confirmation.")
+	fs.BoolVar(&cfg.AssumeYes, "yes", false, "In agent mode, run proposed commands without asking for confirmation.")
+	fs.StringVar(&cfg.ReasoningEffort, "r", cfg.ReasoningEffort, "Codex reasoning effort (minimal, low, medium, high).")
+	fs.StringVar(&cfg.ReasoningEffort, "reasoning", cfg.ReasoningEffort, "Codex reasoning effort (minimal, low, medium, high).")
 
 	fs.Usage = func() {
 		fmt.Fprintf(errOut, "Usage: ais [options] [prompt words...]\n")
@@ -256,6 +295,14 @@ func parseArgs(args []string, errOut io.Writer) (Config, error) {
 	if *noStream {
 		cfg.Stream = false
 	}
+	// Track whether the model was set on the command line (vs. inherited from
+	// saved config), so the agent path knows it may upgrade to a stronger planner
+	// model only when the user did not explicitly pin one.
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "m" || f.Name == "model" {
+			cfg.ModelExplicit = true
+		}
+	})
 	if cfg.Backend != "auto" && cfg.Backend != "codex" && cfg.Backend != "api" && cfg.Backend != "oss" {
 		return Config{}, fmt.Errorf("invalid backend: %s", cfg.Backend)
 	}
@@ -268,9 +315,25 @@ func parseArgs(args []string, errOut io.Writer) (Config, error) {
 	if cfg.TruncateMode != "head" && cfg.TruncateMode != "tail" && cfg.TruncateMode != "middle" {
 		cfg.TruncateMode = defaultTruncateMode
 	}
+	if !validReasoningEffort(cfg.ReasoningEffort) {
+		cfg.ReasoningEffort = defaultReasoning
+	}
 
 	cfg.PromptWords = fs.Args()
 	return cfg, nil
+}
+
+// joinTask combines the -p prompt flag and positional words into a single task
+// string (used by the agent path, which does not read piped stdin).
+func joinTask(cfg Config) string {
+	parts := make([]string, 0, 2)
+	if strings.TrimSpace(cfg.PromptFlag) != "" {
+		parts = append(parts, strings.TrimSpace(cfg.PromptFlag))
+	}
+	if len(cfg.PromptWords) > 0 {
+		parts = append(parts, strings.Join(cfg.PromptWords, " "))
+	}
+	return strings.TrimSpace(strings.Join(parts, " "))
 }
 
 func buildPrompt(cfg Config, in io.Reader) (string, InputStats, error) {
@@ -527,10 +590,14 @@ func callCodex(cfg Config, prompt string, stream bool, onDelta func(string)) (ma
 	_ = tmpFile.Close()
 	defer os.Remove(outputPath)
 
-	combinedPrompt := "System instructions:\n" + cfg.System + "\n\nUser request:\n" + prompt
+	// Framed as a direct question/answer rather than a labelled task spec, which
+	// otherwise nudges agentic Codex models (e.g. gpt-5.5) into replying with
+	// "what would you like me to work on?" instead of just answering.
+	combinedPrompt := cfg.System + "\n\nRespond directly to the following, then stop:\n\n" + prompt
 
 	if !stream {
 		args := []string{"exec", "--skip-git-repo-check", "-o", outputPath}
+		args = append(args, codexReasoningArgs(cfg.ReasoningEffort)...)
 		if cfg.Backend == "oss" {
 			args = append(args, "--oss")
 			if cfg.LocalProvider != "" {
@@ -564,6 +631,7 @@ func callCodex(cfg Config, prompt string, stream bool, onDelta func(string)) (ma
 	}
 
 	args := []string{"exec", "--skip-git-repo-check", "--json", "-o", outputPath}
+	args = append(args, codexReasoningArgs(cfg.ReasoningEffort)...)
 	if cfg.Backend == "oss" {
 		args = append(args, "--oss")
 		if cfg.LocalProvider != "" {
@@ -1021,11 +1089,10 @@ func printModelCatalog(cfg Config, backend string, out io.Writer) {
 	case "codex":
 		fmt.Fprintln(out, "")
 		fmt.Fprintln(out, "Codex model picker:")
-		fmt.Fprintln(out, "  ais --backend codex --model gpt-5.1-codex-mini \"quick question\"")
-		fmt.Fprintln(out, "  ais --backend codex --model gpt-5.1-codex \"normal coding task\"")
-		fmt.Fprintln(out, "  ais --backend codex --model gpt-5.2-codex \"stronger latest codex model\"")
-		fmt.Fprintln(out, "  ais --backend codex --model gpt-5.1-codex-max \"hard repo change\"")
-		fmt.Fprintln(out, "  ais --backend codex --model gpt-5-codex \"older codex model\"")
+		fmt.Fprintln(out, "  ais --backend codex --model gpt-5.5 \"strongest, latest\"")
+		fmt.Fprintln(out, "  ais --backend codex --model gpt-5.4 \"fast, capable\"")
+		fmt.Fprintln(out, "  ais --backend codex --model gpt-5.4-mini \"quick and cheap\"")
+		fmt.Fprintln(out, "  ais --backend codex --model gpt-5.4-nano \"fastest and cheapest\"")
 		fmt.Fprintln(out, "")
 		fmt.Fprintln(out, "Notes:")
 		fmt.Fprintln(out, "  - If --model is omitted, ais uses its saved default first, then Codex config when present.")
@@ -1116,13 +1183,12 @@ func runConfigure(cfg Config, in io.Reader, out io.Writer, errOut io.Writer) err
 			currentModel = cfg.Model
 		}
 		model, err := chooseOption(reader, inFile, outFile, out, "Default Codex model", []string{
-			"gpt-5.2-codex",
-			"gpt-5.1-codex-mini",
-			"gpt-5.1-codex",
-			"gpt-5.1-codex-max",
-			"gpt-5-codex",
+			"gpt-5.5",
+			"gpt-5.4",
+			"gpt-5.4-mini",
+			"gpt-5.4-nano",
 			"custom",
-		}, defaultChoice(currentModel, "gpt-5.1-codex-mini"))
+		}, defaultChoice(currentModel, "gpt-5.5"))
 		if err != nil {
 			return err
 		}
@@ -1133,6 +1199,17 @@ func runConfigure(cfg Config, in io.Reader, out io.Writer, errOut io.Writer) err
 			}
 		}
 		saved.Model = model
+
+		// Reasoning effort applies to Codex's gpt-5.x models. Lower is faster.
+		effort, err := chooseOption(reader, inFile, outFile, out, "Reasoning effort (lower = faster, higher = more thorough)", []string{
+			"low",
+			"medium",
+			"high",
+		}, defaultChoice(cfg.ReasoningEffort, defaultReasoning))
+		if err != nil {
+			return err
+		}
+		saved.ReasoningEffort = effort
 	case "api":
 		currentModel := ""
 		if cfg.Backend == "api" {
@@ -1189,6 +1266,9 @@ func runConfigure(cfg Config, in io.Reader, out io.Writer, errOut io.Writer) err
 	if saved.Model != "" {
 		fmt.Fprintf(out, "Default model: %s\n", saved.Model)
 	}
+	if saved.ReasoningEffort != "" {
+		fmt.Fprintf(out, "Reasoning effort: %s\n", saved.ReasoningEffort)
+	}
 	fmt.Fprintln(out, "")
 	fmt.Fprintln(out, "Flags still override saved defaults for one-off runs.")
 	fmt.Fprintln(out, "Example: ais what does awk do?")
@@ -1226,6 +1306,29 @@ func chooseOption(reader *bufio.Reader, inFile *os.File, outFile *os.File, out i
 	return options[idx-1], nil
 }
 
+// selectKeyKind is the platform-neutral result of one keypress while the
+// arrow-key picker is active. Each OS reads raw input differently (stty + ANSI
+// escapes on Unix, ReadConsoleInput on Windows) but funnels into these kinds.
+type selectKeyKind int
+
+const (
+	selectKeyNone selectKeyKind = iota
+	selectKeyUp
+	selectKeyDown
+	selectKeyEnter
+	selectKeyCancel
+	selectKeyDigit
+)
+
+type selectKey struct {
+	kind  selectKeyKind
+	digit int // 1-9, valid only when kind == selectKeyDigit
+}
+
+// errSelectCancelled is returned when the user aborts the picker (Esc) so the
+// caller can exit cleanly instead of treating it as a hard error.
+var errSelectCancelled = errors.New("selection cancelled")
+
 func chooseOptionInteractive(inFile *os.File, outFile *os.File, label string, options []string, current string) (string, error) {
 	selected := 0
 	for i, option := range options {
@@ -1241,9 +1344,16 @@ func chooseOptionInteractive(inFile *os.File, outFile *os.File, label string, op
 	}
 	defer restore()
 
-	fmt.Fprint(outFile, "\033[s")
+	// Redraw in place by moving the cursor up over the previously drawn lines and
+	// clearing downward, rather than ANSI save/restore cursor (\033[s / \033[u),
+	// which is unreliable on Windows consoles and caused each keypress to print a
+	// fresh stacked copy of the menu.
+	prevLines := 0
 	render := func() {
-		fmt.Fprint(outFile, "\033[u\r\033[J")
+		if prevLines > 0 {
+			fmt.Fprintf(outFile, "\033[%dA", prevLines)
+		}
+		fmt.Fprint(outFile, "\r\033[J")
 		lines := make([]string, 0, len(options)+2)
 		lines = append(lines, label+":")
 		lines = append(lines, "  arrows/jk move, Enter confirms, 1-9 picks")
@@ -1263,59 +1373,37 @@ func chooseOptionInteractive(inFile *os.File, outFile *os.File, label string, op
 		}
 		fmt.Fprint(outFile, strings.Join(lines, "\r\n"))
 		fmt.Fprint(outFile, "\r\n")
+		prevLines = len(lines)
 	}
 
 	render()
-	buf := make([]byte, 3)
 	for {
-		n, err := inFile.Read(buf[:1])
+		key, err := readSelectKey(inFile)
 		if err != nil {
 			return "", err
 		}
-		if n == 0 {
-			continue
-		}
-		b := buf[0]
-		switch b {
-		case '\r', '\n':
-			fmt.Fprintln(outFile)
-			return options[selected], nil
-		case 'k':
+		switch key.kind {
+		case selectKeyUp:
 			if selected > 0 {
 				selected--
 				render()
 			}
-		case 'j':
+		case selectKeyDown:
 			if selected < len(options)-1 {
 				selected++
 				render()
 			}
-		case 27:
-			_, err := inFile.Read(buf[1:3])
-			if err != nil {
-				return "", err
-			}
-			if buf[1] == '[' {
-				switch buf[2] {
-				case 'A':
-					if selected > 0 {
-						selected--
-						render()
-					}
-				case 'B':
-					if selected < len(options)-1 {
-						selected++
-						render()
-					}
-				}
-			}
-		default:
-			if b >= '1' && b <= '9' {
-				idx := int(b - '1')
-				if idx >= 0 && idx < len(options) {
-					fmt.Fprintln(outFile)
-					return options[idx], nil
-				}
+		case selectKeyEnter:
+			fmt.Fprintln(outFile)
+			return options[selected], nil
+		case selectKeyCancel:
+			fmt.Fprintln(outFile)
+			return "", errSelectCancelled
+		case selectKeyDigit:
+			idx := key.digit - 1
+			if idx >= 0 && idx < len(options) {
+				fmt.Fprintln(outFile)
+				return options[idx], nil
 			}
 		}
 	}
@@ -1348,6 +1436,24 @@ func defaultChoice(current string, fallback string) string {
 		return strings.TrimSpace(current)
 	}
 	return fallback
+}
+
+func validReasoningEffort(effort string) bool {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "minimal", "low", "medium", "high":
+		return true
+	}
+	return false
+}
+
+// codexReasoningArgs returns the `-c model_reasoning_effort="..."` override for a
+// codex invocation, or nil if the effort is unset/invalid (leaving Codex's own
+// config default in place).
+func codexReasoningArgs(effort string) []string {
+	if !validReasoningEffort(effort) {
+		return nil
+	}
+	return []string{"-c", fmt.Sprintf("model_reasoning_effort=%q", strings.ToLower(strings.TrimSpace(effort)))}
 }
 
 func loadSavedConfig() SavedConfig {
