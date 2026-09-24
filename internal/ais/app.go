@@ -24,15 +24,18 @@ import (
 
 const (
 	apiURL               = "https://api.openai.com/v1/responses"
-	defaultAPIModel      = "gpt-4.1-mini"
+	defaultAPIModel      = "gpt-6-luna"
 	defaultBackend       = "auto"
 	defaultRenderMode    = "auto"
 	defaultSystemPrompt  = "You are a practical terminal assistant. Answer the user's question or request directly and immediately; never ask what they want to work on or offer to start a task. Keep answers concise and clear. Use short sections and bullets where useful. Avoid markdown tables."
 	defaultMaxInputChars = 120000
 	defaultTruncateMode  = "head"
 	defaultReasoning     = "low"
-	version              = "0.4.0"
 )
+
+// version is overridden at release time with
+// -ldflags "-X github.com/sqmch/ais/internal/ais.version=<tag>".
+var version = "dev"
 
 const (
 	ansiReset  = "\033[0m"
@@ -64,8 +67,8 @@ type Config struct {
 	ShowVersion     bool
 	Agent           bool
 	AssumeYes       bool
+	DryRun          bool
 	ReasoningEffort string
-	ModelExplicit   bool
 }
 
 type SavedConfig struct {
@@ -120,25 +123,18 @@ func Run(args []string, in io.Reader, out io.Writer, errOut io.Writer) int {
 		return 0
 	}
 
-	// Routing: on the Codex backend, an interactive request (no piped stdin) is
-	// classified locally — an action ("kill the server on port 8080") goes to the
-	// agent path that proposes and runs commands; a question goes to the classic
-	// Q&A path below. `-a` forces the action path. Piped input (summaries) and
-	// non-Codex backends always use the classic Q&A path.
+	// Routing: on the Codex backend, an interactive request (no piped stdin) goes
+	// to the agent path, where one model call either answers it or proposes a
+	// command to run. `-a` forces a command. Piped input (summaries) and
+	// non-Codex backends use the classic Q&A path below.
 	stdinPiped := !readerIsTTY(in)
-	if cfg.Agent || (!stdinPiped && resolveBackend(cfg.Backend) == "codex") {
+	if cfg.Agent || cfg.DryRun || (!stdinPiped && resolveBackend(cfg.Backend) == "codex") {
 		if resolveBackend(cfg.Backend) != "codex" {
 			fmt.Fprintln(errOut, "Running commands (-a) requires the Codex backend.")
 			return 2
 		}
-		task := joinTask(cfg)
-		if cfg.Agent || looksLikeCommand(task) {
+		if task := joinTask(cfg); task != "" || cfg.Agent {
 			return runAgent(cfg, task, in, out, errOut)
-		}
-		// A question on the Codex backend: use the structured Q&A path, which is
-		// far more reliable than free-form prompting of codex exec.
-		if task != "" {
-			return runCodexQA(cfg, task, out, errOut)
 		}
 	}
 
@@ -188,7 +184,7 @@ func Run(args []string, in io.Reader, out io.Writer, errOut io.Writer) int {
 		}
 
 		if backend == "codex" || backend == "oss" {
-			result, err = callCodex(cfg, prompt, true, onDelta)
+			result, err = callCodex(cfg, backend, prompt)
 		} else {
 			result, err = callAPI(cfg, prompt, true, onDelta)
 		}
@@ -196,7 +192,7 @@ func Run(args []string, in io.Reader, out io.Writer, errOut io.Writer) int {
 		spinner := NewSpinner(fmt.Sprintf("Thinking via %s (%s)", backend, activeModel), spinnerEnabled, errOut)
 		spinner.Start()
 		if backend == "codex" || backend == "oss" {
-			result, err = callCodex(cfg, prompt, false, nil)
+			result, err = callCodex(cfg, backend, prompt)
 		} else {
 			result, err = callAPI(cfg, prompt, false, nil)
 		}
@@ -243,7 +239,7 @@ func parseArgs(args []string, errOut io.Writer) (Config, error) {
 		Model:           firstNonEmpty(os.Getenv("AIS_MODEL"), saved.Model),
 		LocalProvider:   firstNonEmpty(os.Getenv("AIS_LOCAL_PROVIDER"), saved.LocalProvider),
 		System:          envOr("AIS_SYSTEM_PROMPT", defaultSystemPrompt),
-		MaxOutputTokens: 700,
+		MaxOutputTokens: 2000,
 		Temperature:     0.2,
 		Render:          envOr("AIS_RENDER", defaultRenderMode),
 		Stream:          envBool("AIS_STREAM", true),
@@ -277,12 +273,14 @@ func parseArgs(args []string, errOut io.Writer) (Config, error) {
 	fs.BoolVar(&cfg.ListModels, "list-models", false, "List practical model choices for the selected backend and exit.")
 	fs.BoolVar(&cfg.Configure, "configure", false, "Open an interactive default backend/model picker and save the result.")
 	fs.BoolVar(&cfg.ShowVersion, "version", false, "Show version and exit.")
-	fs.BoolVar(&cfg.Agent, "a", false, "Agent mode: let ais run shell commands to accomplish a task (asks before each).")
-	fs.BoolVar(&cfg.Agent, "agent", false, "Agent mode: let ais run shell commands to accomplish a task (asks before each).")
-	fs.BoolVar(&cfg.AssumeYes, "y", false, "In agent mode, run proposed commands without asking for confirmation.")
-	fs.BoolVar(&cfg.AssumeYes, "yes", false, "In agent mode, run proposed commands without asking for confirmation.")
-	fs.StringVar(&cfg.ReasoningEffort, "r", cfg.ReasoningEffort, "Codex reasoning effort (minimal, low, medium, high).")
-	fs.StringVar(&cfg.ReasoningEffort, "reasoning", cfg.ReasoningEffort, "Codex reasoning effort (minimal, low, medium, high).")
+	fs.BoolVar(&cfg.Agent, "a", false, "Always turn the request into a command to run (asks before running).")
+	fs.BoolVar(&cfg.Agent, "agent", false, "Always turn the request into a command to run (asks before running).")
+	fs.BoolVar(&cfg.AssumeYes, "y", false, "Run proposed commands without asking for confirmation.")
+	fs.BoolVar(&cfg.AssumeYes, "yes", false, "Run proposed commands without asking for confirmation.")
+	fs.BoolVar(&cfg.DryRun, "n", false, "Show the proposed command but do not run it.")
+	fs.BoolVar(&cfg.DryRun, "dry-run", false, "Show the proposed command but do not run it.")
+	fs.StringVar(&cfg.ReasoningEffort, "r", cfg.ReasoningEffort, "Reasoning effort (low, medium, high, xhigh, ...; see --list-models).")
+	fs.StringVar(&cfg.ReasoningEffort, "reasoning", cfg.ReasoningEffort, "Reasoning effort (low, medium, high, xhigh, ...; see --list-models).")
 
 	fs.Usage = func() {
 		fmt.Fprintf(errOut, "Usage: ais [options] [prompt words...]\n")
@@ -295,14 +293,6 @@ func parseArgs(args []string, errOut io.Writer) (Config, error) {
 	if *noStream {
 		cfg.Stream = false
 	}
-	// Track whether the model was set on the command line (vs. inherited from
-	// saved config), so the agent path knows it may upgrade to a stronger planner
-	// model only when the user did not explicitly pin one.
-	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "m" || f.Name == "model" {
-			cfg.ModelExplicit = true
-		}
-	})
 	if cfg.Backend != "auto" && cfg.Backend != "codex" && cfg.Backend != "api" && cfg.Backend != "oss" {
 		return Config{}, fmt.Errorf("invalid backend: %s", cfg.Backend)
 	}
@@ -439,12 +429,21 @@ func callAPI(cfg Config, prompt string, stream bool, onDelta func(string)) (map[
 		return nil, fmt.Errorf("API backend requested but OPENAI_API_KEY is not set.")
 	}
 
+	model := firstNonEmpty(cfg.Model, defaultAPIModel)
 	payload := map[string]any{
-		"model":             firstNonEmpty(cfg.Model, defaultAPIModel),
+		"model":             model,
 		"instructions":      cfg.System,
 		"input":             prompt,
 		"max_output_tokens": cfg.MaxOutputTokens,
-		"temperature":       cfg.Temperature,
+	}
+	// Reasoning models (gpt-5 and later, o-series) reject temperature and take a
+	// reasoning effort instead; older models are the reverse.
+	if isReasoningModel(model) {
+		if validReasoningEffort(cfg.ReasoningEffort) {
+			payload["reasoning"] = map[string]any{"effort": strings.ToLower(cfg.ReasoningEffort)}
+		}
+	} else {
+		payload["temperature"] = cfg.Temperature
 	}
 	if stream {
 		payload["stream"] = true
@@ -570,175 +569,23 @@ func callAPI(cfg Config, prompt string, stream bool, onDelta func(string)) (map[
 	return responseObj, nil
 }
 
-func callCodex(cfg Config, prompt string, stream bool, onDelta func(string)) (map[string]any, error) {
-	codexBin := findCodexBinary()
-	if codexBin == "" {
-		return nil, fmt.Errorf("codex backend requested but `codex` is not installed. Install Codex CLI or use --backend api.")
+// callCodex answers a free-form prompt (e.g. piped input to summarize) through
+// Codex, with the system prompt as Codex's instructions. backend is "codex" or
+// "oss".
+func callCodex(cfg Config, backend string, prompt string) (map[string]any, error) {
+	if backend == "codex" && cfg.Backend == "codex" {
+		if bin := findCodexBinary(); bin != "" && !isCodexLoggedIn(bin) {
+			return nil, fmt.Errorf("codex backend requested but not logged in. Run `codex login`.")
+		}
 	}
-	if cfg.Backend == "codex" && !isCodexLoggedIn(codexBin) {
-		return nil, fmt.Errorf("codex backend requested but not logged in. Run `codex login`.")
-	}
-	if cfg.Backend == "oss" && cfg.Model == "" {
+	if backend == "oss" && cfg.Model == "" {
 		return nil, fmt.Errorf("oss backend requested but no model was set. Pass --model with a local Ollama or LM Studio model name.")
 	}
-
-	tmpFile, err := os.CreateTemp("", "ais-codex-*.txt")
+	text, err := codexCall(cfg, backend, cfg.System, prompt, "")
 	if err != nil {
 		return nil, err
 	}
-	outputPath := tmpFile.Name()
-	_ = tmpFile.Close()
-	defer os.Remove(outputPath)
-
-	// Framed as a direct question/answer rather than a labelled task spec, which
-	// otherwise nudges agentic Codex models (e.g. gpt-5.5) into replying with
-	// "what would you like me to work on?" instead of just answering.
-	combinedPrompt := cfg.System + "\n\nRespond directly to the following, then stop:\n\n" + prompt
-
-	if !stream {
-		args := []string{"exec", "--skip-git-repo-check", "-o", outputPath}
-		args = append(args, codexReasoningArgs(cfg.ReasoningEffort)...)
-		if cfg.Backend == "oss" {
-			args = append(args, "--oss")
-			if cfg.LocalProvider != "" {
-				args = append(args, "--local-provider", cfg.LocalProvider)
-			}
-		}
-		if cfg.Model != "" {
-			args = append(args, "-m", cfg.Model)
-		}
-		args = append(args, combinedPrompt)
-
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		defer cancel()
-		cmd := exec.CommandContext(ctx, codexBin, args...)
-		var stdout, stderr bytes.Buffer
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
-		err := cmd.Run()
-
-		text := readFileTrim(outputPath)
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, fmt.Errorf("codex backend timed out.")
-		}
-		if err != nil {
-			return nil, fmt.Errorf("codex backend failed: %s", summarizeCodexFailure(stdout.String(), stderr.String()))
-		}
-		if text == "" {
-			return nil, fmt.Errorf("codex backend returned empty output.")
-		}
-		return map[string]any{"output_text": text, "backend": "codex"}, nil
-	}
-
-	args := []string{"exec", "--skip-git-repo-check", "--json", "-o", outputPath}
-	args = append(args, codexReasoningArgs(cfg.ReasoningEffort)...)
-	if cfg.Backend == "oss" {
-		args = append(args, "--oss")
-		if cfg.LocalProvider != "" {
-			args = append(args, "--local-provider", cfg.LocalProvider)
-		}
-	}
-	if cfg.Model != "" {
-		args = append(args, "-m", cfg.Model)
-	}
-	args = append(args, combinedPrompt)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, codexBin, args...)
-
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, err
-	}
-
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-
-	stderrLines := make([]string, 0, 32)
-	var stderrMu sync.Mutex
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		s := bufio.NewScanner(stderrPipe)
-		for s.Scan() {
-			stderrMu.Lock()
-			stderrLines = append(stderrLines, strings.TrimSpace(s.Text()))
-			stderrMu.Unlock()
-		}
-	}()
-
-	deltas := make([]string, 0, 64)
-	codexErrors := make([]string, 0, 8)
-	sawTurnFailed := false
-
-	s := bufio.NewScanner(stdoutPipe)
-	for s.Scan() {
-		line := strings.TrimSpace(s.Text())
-		if line == "" || !strings.HasPrefix(line, "{") {
-			continue
-		}
-		var event map[string]any
-		if err := json.Unmarshal([]byte(line), &event); err != nil {
-			continue
-		}
-
-		if msg := extractCodexEventError(event); msg != "" {
-			codexErrors = append(codexErrors, msg)
-			if asString(event["type"]) == "turn.failed" {
-				sawTurnFailed = true
-			}
-		}
-
-		if delta := extractCodexTextDelta(event); delta != "" {
-			deltas = append(deltas, delta)
-			if onDelta != nil {
-				onDelta(delta)
-			}
-		}
-	}
-
-	runErr := cmd.Wait()
-	wg.Wait()
-
-	text := readFileTrim(outputPath)
-	if text == "" && len(deltas) > 0 {
-		text = strings.TrimSpace(strings.Join(deltas, ""))
-	}
-
-	if ctx.Err() == context.DeadlineExceeded {
-		return nil, fmt.Errorf("codex backend timed out.")
-	}
-
-	stderrMu.Lock()
-	stderrJoined := strings.Join(stderrLines, "\n")
-	stderrMu.Unlock()
-
-	if sawTurnFailed || (runErr != nil && text == "") {
-		details := chooseCodexError(codexErrors)
-		if details == "" {
-			details = summarizeCodexFailure("", stderrJoined)
-		}
-		if details == "" {
-			details = "unknown codex error"
-		}
-		return nil, fmt.Errorf("codex backend failed: %s", details)
-	}
-
-	if text == "" {
-		if details := chooseCodexError(codexErrors); details != "" {
-			return nil, fmt.Errorf("codex backend failed: %s", details)
-		}
-		return nil, fmt.Errorf("codex backend returned empty output.")
-	}
-
-	return map[string]any{"output_text": text, "backend": "codex"}, nil
+	return map[string]any{"output_text": text, "backend": backend}, nil
 }
 
 func extractOutputText(response map[string]any) string {
@@ -824,74 +671,6 @@ func extractStreamError(event map[string]any) string {
 	return ""
 }
 
-func extractCodexEventError(event map[string]any) string {
-	t := asString(event["type"])
-	switch t {
-	case "error":
-		msg := asString(event["message"])
-		if strings.Contains(msg, "Failed to shutdown rollout recorder") {
-			return ""
-		}
-		return msg
-	case "turn.failed":
-		if errObj, ok := event["error"].(map[string]any); ok {
-			if msg := asString(errObj["message"]); msg != "" {
-				return msg
-			}
-		}
-	}
-	return ""
-}
-
-func extractCodexTextDelta(event map[string]any) string {
-	t := asString(event["type"])
-	switch t {
-	case "agent_message_delta", "agent_message.delta", "assistant_message.delta", "response.output_text.delta":
-		if s := asString(event["delta"]); s != "" {
-			return s
-		}
-		if dm, ok := event["delta"].(map[string]any); ok {
-			if s := asString(dm["text"]); s != "" {
-				return s
-			}
-		}
-		if s := asString(event["text_delta"]); s != "" {
-			return s
-		}
-		return asString(event["text"])
-	case "item.updated":
-		item, ok := event["item"].(map[string]any)
-		if !ok {
-			return ""
-		}
-		if s := asString(item["delta"]); s != "" {
-			return s
-		}
-		if dm, ok := item["delta"].(map[string]any); ok {
-			if s := asString(dm["text"]); s != "" {
-				return s
-			}
-		}
-		return asString(item["text_delta"])
-	}
-	return ""
-}
-
-func chooseCodexError(errors []string) string {
-	if len(errors) == 0 {
-		return ""
-	}
-	for i := len(errors) - 1; i >= 0; i-- {
-		if strings.Contains(errors[i], "Failed to shutdown rollout recorder") {
-			continue
-		}
-		if strings.TrimSpace(errors[i]) != "" {
-			return errors[i]
-		}
-	}
-	return errors[len(errors)-1]
-}
-
 func summarizeCodexFailure(stdout, stderr string) string {
 	joined := stderr + "\n" + stdout
 	linesRaw := strings.Split(joined, "\n")
@@ -946,12 +725,19 @@ func isCodexLoggedIn(codexBin string) bool {
 	return strings.Contains(low, "logged in")
 }
 
+var (
+	headingRe    = regexp.MustCompile(`^(#{1,6})\s+(.+)$`)
+	bulletRe     = regexp.MustCompile(`^(\s*)([-*+]|\d+\.)\s+(.*)$`)
+	inlineCodeRe = regexp.MustCompile("`[^`\n]+`")
+	boldStarRe   = regexp.MustCompile(`\*\*[^*\n]+\*\*`)
+	boldUnderRe  = regexp.MustCompile(`__[^_\n]+__`)
+	italicRe     = regexp.MustCompile(`\*[^*\n]+\*`)
+)
+
 func renderMarkdownANSI(text string) string {
 	lines := strings.Split(text, "\n")
 	rendered := make([]string, 0, len(lines))
 	inCode := false
-	headingRe := regexp.MustCompile(`^(#{1,6})\s+(.+)$`)
-	bulletRe := regexp.MustCompile(`^(\s*)([-*+]|\d+\.)\s+(.*)$`)
 
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
@@ -997,30 +783,25 @@ func renderMarkdownANSI(text string) string {
 }
 
 func renderInlineMarkdown(text string) string {
-	codeRe := regexp.MustCompile("`[^`\n]+`")
-	boldA := regexp.MustCompile(`\*\*[^*\n]+\*\*`)
-	boldB := regexp.MustCompile(`__[^_\n]+__`)
-	italic := regexp.MustCompile(`\*[^*\n]+\*`)
-
-	text = codeRe.ReplaceAllStringFunc(text, func(m string) string {
+	text = inlineCodeRe.ReplaceAllStringFunc(text, func(m string) string {
 		if len(m) < 2 {
 			return m
 		}
 		return ansi(m[1:len(m)-1], ansiYellow)
 	})
-	text = boldA.ReplaceAllStringFunc(text, func(m string) string {
+	text = boldStarRe.ReplaceAllStringFunc(text, func(m string) string {
 		if len(m) < 4 {
 			return m
 		}
 		return ansi(m[2:len(m)-2], ansiBold)
 	})
-	text = boldB.ReplaceAllStringFunc(text, func(m string) string {
+	text = boldUnderRe.ReplaceAllStringFunc(text, func(m string) string {
 		if len(m) < 4 {
 			return m
 		}
 		return ansi(m[2:len(m)-2], ansiBold)
 	})
-	text = italic.ReplaceAllStringFunc(text, func(m string) string {
+	text = italicRe.ReplaceAllStringFunc(text, func(m string) string {
 		if len(m) < 3 || strings.HasPrefix(m, "**") || strings.HasSuffix(m, "**") {
 			return m
 		}
@@ -1069,13 +850,12 @@ func effectiveModel(cfg Config, backend string) string {
 	switch backend {
 	case "api":
 		return defaultAPIModel
-	case "codex", "oss":
-		if model := readCodexConfigModel(); model != "" {
-			return model
-		}
-		return "codex-default"
+	case "codex":
+		// Deliberately not the model from the user's Codex config: ais runs with
+		// --ignore-user-config and defaults to a fast model of its own.
+		return defaultCodexModel
 	default:
-		return "default"
+		return ""
 	}
 }
 
@@ -1087,22 +867,37 @@ func printModelCatalog(cfg Config, backend string, out io.Writer) {
 
 	switch backend {
 	case "codex":
+		models, live := loadCodexModels(findCodexBinary())
 		fmt.Fprintln(out, "")
-		fmt.Fprintln(out, "Codex model picker:")
-		fmt.Fprintln(out, "  ais --backend codex --model gpt-5.5 \"strongest, latest\"")
-		fmt.Fprintln(out, "  ais --backend codex --model gpt-5.4 \"fast, capable\"")
-		fmt.Fprintln(out, "  ais --backend codex --model gpt-5.4-mini \"quick and cheap\"")
-		fmt.Fprintln(out, "  ais --backend codex --model gpt-5.4-nano \"fastest and cheapest\"")
+		if live {
+			fmt.Fprintln(out, "Models available to your Codex account:")
+		} else {
+			fmt.Fprintln(out, "Codex models (built-in list; could not read `codex debug models`):")
+		}
+		for _, m := range models {
+			marker := "  "
+			if m.Slug == activeModel {
+				marker = "* "
+			}
+			fmt.Fprintf(out, "  %s%-16s %s\n", marker, m.Slug, m.Description)
+			if len(m.Efforts) > 0 {
+				fmt.Fprintf(out, "      reasoning: %s\n", strings.Join(m.Efforts, ", "))
+			}
+			if m.Notice != "" {
+				fmt.Fprintf(out, "      note: %s\n", m.Notice)
+			}
+		}
+		if _, ok := findModel(models, activeModel); !ok && live {
+			fmt.Fprintf(out, "\nWarning: the active model %q is not in your account's model list.\n", activeModel)
+		}
 		fmt.Fprintln(out, "")
-		fmt.Fprintln(out, "Notes:")
-		fmt.Fprintln(out, "  - If --model is omitted, ais uses its saved default first, then Codex config when present.")
-		fmt.Fprintln(out, "  - Codex CLI accepts arbitrary model strings, but the server decides whether your account can actually run them.")
+		fmt.Fprintln(out, "Use one with -m, or save a default with ais --configure.")
 	case "api":
 		fmt.Fprintln(out, "")
 		fmt.Fprintln(out, "API model picker:")
-		fmt.Fprintln(out, "  ais --backend api --model gpt-4.1-mini \"quick question\"")
-		fmt.Fprintln(out, "  ais --backend api --model gpt-5-mini \"better quality, still fast\"")
-		fmt.Fprintln(out, "  ais --backend api --model gpt-5 \"stronger general model\"")
+		fmt.Fprintln(out, "  ais --backend api --model gpt-6-luna \"fast and affordable\"")
+		fmt.Fprintln(out, "  ais --backend api --model gpt-6-sol \"everyday workhorse\"")
+		fmt.Fprintln(out, "  ais --backend api --model gpt-6-astra \"strongest\"")
 		fmt.Fprintln(out, "")
 		fmt.Fprintln(out, "Notes:")
 		fmt.Fprintln(out, "  - API backend requires OPENAI_API_KEY.")
@@ -1128,31 +923,6 @@ func printModelCatalog(cfg Config, backend string, out io.Writer) {
 		fmt.Fprintln(out, "  ais --backend api --list-models")
 		fmt.Fprintln(out, "  ais --backend oss --list-models")
 	}
-}
-
-func readCodexConfigModel() string {
-	home := homeDir()
-	if home == "" {
-		return ""
-	}
-	b, err := os.ReadFile(filepath.Join(home, ".codex", "config.toml"))
-	if err != nil {
-		return ""
-	}
-	for _, line := range strings.Split(string(b), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "[") {
-			break
-		}
-		if strings.HasPrefix(trimmed, "model") {
-			parts := strings.SplitN(trimmed, "=", 2)
-			if len(parts) != 2 {
-				continue
-			}
-			return strings.Trim(strings.TrimSpace(parts[1]), "\"'")
-		}
-	}
-	return ""
 }
 
 func runConfigure(cfg Config, in io.Reader, out io.Writer, errOut io.Writer) error {
@@ -1182,30 +952,41 @@ func runConfigure(cfg Config, in io.Reader, out io.Writer, errOut io.Writer) err
 		if cfg.Backend == "codex" {
 			currentModel = cfg.Model
 		}
-		model, err := chooseOption(reader, inFile, outFile, out, "Default Codex model", []string{
-			"gpt-5.5",
-			"gpt-5.4",
-			"gpt-5.4-mini",
-			"gpt-5.4-nano",
-			"custom",
-		}, defaultChoice(currentModel, "gpt-5.5"))
+		models, _ := loadCodexModels(findCodexBinary())
+		options := make([]string, 0, len(models)+1)
+		for _, m := range models {
+			options = append(options, m.Slug)
+		}
+		options = append(options, "custom")
+		if _, ok := findModel(models, currentModel); !ok {
+			if currentModel != "" {
+				fmt.Fprintf(out, "Your saved model %q is no longer offered; pick a new one.\n\n", currentModel)
+			}
+			currentModel = defaultCodexModel
+		}
+		model, err := chooseOption(reader, inFile, outFile, out, "Default model (gpt-6-luna is fastest)", options, currentModel)
 		if err != nil {
 			return err
 		}
 		if model == "custom" {
-			model, err = promptLine(reader, out, "Enter Codex model name", currentModel)
+			model, err = promptLine(reader, out, "Enter Codex model name", "")
 			if err != nil {
 				return err
 			}
 		}
 		saved.Model = model
 
-		// Reasoning effort applies to Codex's gpt-5.x models. Lower is faster.
-		effort, err := chooseOption(reader, inFile, outFile, out, "Reasoning effort (lower = faster, higher = more thorough)", []string{
-			"low",
-			"medium",
-			"high",
-		}, defaultChoice(cfg.ReasoningEffort, defaultReasoning))
+		efforts := []string{"low", "medium", "high", "xhigh"}
+		if m, ok := findModel(models, model); ok && len(m.Efforts) > 0 {
+			efforts = m.Efforts
+		}
+		currentEffort := defaultReasoning
+		for _, e := range efforts {
+			if e == cfg.ReasoningEffort {
+				currentEffort = e
+			}
+		}
+		effort, err := chooseOption(reader, inFile, outFile, out, "Reasoning effort (lower = faster, higher = more thorough)", efforts, currentEffort)
 		if err != nil {
 			return err
 		}
@@ -1216,9 +997,9 @@ func runConfigure(cfg Config, in io.Reader, out io.Writer, errOut io.Writer) err
 			currentModel = cfg.Model
 		}
 		model, err := chooseOption(reader, inFile, outFile, out, "Default API model", []string{
-			"gpt-4.1-mini",
-			"gpt-5-mini",
-			"gpt-5",
+			"gpt-6-luna",
+			"gpt-6-sol",
+			"gpt-6-astra",
 			"custom",
 		}, defaultChoice(currentModel, defaultAPIModel))
 		if err != nil {
@@ -1438,10 +1219,31 @@ func defaultChoice(current string, fallback string) string {
 	return fallback
 }
 
+// validReasoningEffort accepts every effort level current OpenAI models use.
+// Which levels a given model supports varies (see --list-models); an
+// unsupported one is reported by the model service.
 func validReasoningEffort(effort string) bool {
 	switch strings.ToLower(strings.TrimSpace(effort)) {
-	case "minimal", "low", "medium", "high":
+	case "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra":
 		return true
+	}
+	return false
+}
+
+// isReasoningModel reports whether an API model takes a reasoning effort (and
+// rejects temperature): the gpt-5+ and o-series families.
+func isReasoningModel(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if strings.HasPrefix(m, "o") && len(m) > 1 && m[1] >= '0' && m[1] <= '9' {
+		return true
+	}
+	if rest, ok := strings.CutPrefix(m, "gpt-"); ok {
+		major := rest
+		if i := strings.IndexAny(rest, ".-"); i >= 0 {
+			major = rest[:i]
+		}
+		n, err := strconv.Atoi(major)
+		return err == nil && n >= 5
 	}
 	return false
 }
@@ -1697,11 +1499,4 @@ func firstNonEmpty(v, fallback string) string {
 
 func runeLen(s string) int {
 	return len([]rune(s))
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

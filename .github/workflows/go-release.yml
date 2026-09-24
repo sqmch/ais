@@ -24,6 +24,8 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           dist="$(pwd)/dist"
+          # Stamp the tag (minus the leading "v") into the binary's --version.
+          ldflags="-s -w -X github.com/sqmch/ais/internal/ais.version=${GITHUB_REF_NAME#v}"
           platforms=(
             "linux amd64"
             "linux arm64"
@@ -37,10 +39,10 @@ jobs:
             read -r os arch <<<"$p"
             outdir="$(mktemp -d)"
             if [ "$os" = "windows" ]; then
-              CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -o "$outdir/ais.exe" ./cmd/ais
+              CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags "$ldflags" -o "$outdir/ais.exe" ./cmd/ais
               (cd "$outdir" && zip -q "${dist}/ais_${os}_${arch}.zip" ais.exe)
             else
-              CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -o "$outdir/ais" ./cmd/ais
+              CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags "$ldflags" -o "$outdir/ais" ./cmd/ais
               tar -C "$outdir" -czf "${dist}/ais_${os}_${arch}.tar.gz" ais
             fi
             rm -rf "$outdir"

@@ -1,117 +1,79 @@
 # ais
 
-Tiny terminal AI helper. Ask it questions, pipe it text to summarize, or tell it
-to do something and it runs the command for you — all without leaving the shell.
+**Ask your terminal in plain English.** ais turns requests into shell commands
+and runs them after you confirm, answers questions, and explains anything you
+pipe into it.
 
-<img width="1011" height="276" alt="image" src="https://github.com/user-attachments/assets/39638a46-058a-40f3-a420-3f9bbbf0e147" />
+<p align="center">
+  <img src="docs/demo.png" alt="ais finding what is listening on port 3000, then diagnosing a server log" width="860">
+</p>
+
+```sh
+ais what is listening on port 3000          # → proposes a command, runs it on "y"
+ais which files in this repo change the most
+ais undo my last commit but keep the changes
+ais how do I split windows in nvim          # → just answers
+
+git diff | ais -p "any bugs in this change?"
+npm test 2>&1 | ais -p "why is this failing?"
+```
 
 ## Install
 
-**Linux / macOS**
-
-```bash
+```sh
+# Linux / macOS
 curl -fsSL https://raw.githubusercontent.com/sqmch/ais/main/scripts/install.sh | sh
 ```
 
-**Windows (PowerShell)**
-
 ```powershell
+# Windows
 irm https://raw.githubusercontent.com/sqmch/ais/main/scripts/install.ps1 | iex
 ```
 
-Re-run the installer to update. To uninstall, run the same URL with
-`uninstall.sh` / `uninstall.ps1`.
+A single binary with no runtime. Re-run the installer to update; swap in
+`uninstall.sh` / `uninstall.ps1` to remove it. ais uses your
+[Codex CLI](https://github.com/openai/codex) login, so run `codex login` once.
 
-`ais` is a single self-contained binary — no runtime needed. Open a new terminal
-after installing so the PATH change takes effect.
+## How it works
 
-## Use
+- **Run or answer:** ais decides for you. Anything about your machine
+  ("is nginx running?") becomes a command; general questions get an answer.
+- **You stay in control:** every command is shown first, flagged if it changes
+  state or is destructive. `y` runs it, `e` edits it, anything else skips.
+- **Failures get a second look:** if a command fails, ais offers to send the
+  error back to the model and propose a fix.
+- **Runs in your shell** (PowerShell on Windows, `$SHELL` elsewhere) with your
+  terminal attached, so prompts like `sudo` work.
 
-**Ask a question** — get a direct answer:
+## Models
 
-```
-ais how do I split windows in nvim?
-ais what does chmod 755 mean?
-```
+ais defaults to `gpt-6-luna` with low reasoning, which is fast and cheap and
+plenty for one-line commands.
 
-**Pipe text** — summarize or explain piped input with `-p`:
-
-```
-git diff | ais -p "summarize risk and test impact"
-ls -la 2>&1 | ais -p "explain what's wrong"
-```
-
-**Run commands** — describe a task and ais turns it into a shell command, shows
-it, and runs it after you confirm:
-
-```
-ais what is listening on port 3000
-ais kill the process on port 8080
-ais delete all .tmp files in this folder
+```sh
+ais --list-models             # models your account can use
+ais --configure               # pick a default (saved to ~/.config/ais/config.json)
+ais -m gpt-6-sol -r medium …  # one-off override
 ```
 
-```
-$ ais kill the process on port 8080
-Stops the process currently listening on TCP port 8080.
-
-PowerShell will run:
-  Stop-Process -Id (Get-NetTCPConnection -LocalPort 8080).OwningProcess -Force
-Run this command? [y/N]
-```
-
-ais decides whether a request is a question or an action automatically. Force the
-action path with `-a`, skip the confirmation prompt with `-y`, or force a plain
-answer by phrasing it as a question. Commands run in your shell (PowerShell on
-Windows, `$SHELL`/`sh` elsewhere). This feature uses the `codex` backend.
-
-## Configure
-
-```bash
-ais --configure
-```
-
-An interactive picker (arrow keys / Enter) sets your default backend, model, and
-reasoning effort, saved to `~/.config/ais/config.json`. Flags and env vars
-override saved defaults per run.
-
-To keep costs down, ask questions with whatever model you pick, but ais always
-plans **run-command** actions with a strong model (gpt-5.5) for reliability —
-unless you pin one with `-m`.
+ais never touches your Codex setup: it calls Codex with per-run flags only, stays
+out of your session history, and skips your plugins and MCP servers, which also
+keeps it fast.
 
 ## Flags
 
-| Flag | Meaning |
+| Flag | |
 | --- | --- |
-| `-p, --prompt` | Explicit prompt (useful with piped stdin) |
-| `-a, --agent` | Force command-running mode |
-| `-y, --yes` | Run proposed commands without confirming |
-| `-b, --backend` | `auto` \| `codex` \| `api` \| `oss` |
-| `-m, --model` | Model override |
-| `-r, --reasoning` | `minimal` \| `low` \| `medium` \| `high` |
-| `--local-provider` | `ollama` \| `lmstudio` (for `oss`) |
-| `--configure` | Open the settings picker |
-| `--list-models` | Show model choices for the backend |
-| `--stream` / `--no-stream` | Toggle token streaming |
-| `--version` | Print version |
-
-## Backends
-
-- `codex` — your local `codex login` (run `codex login` once to set up)
-- `api` — `OPENAI_API_KEY`
-- `oss` — `codex --oss` with Ollama or LM Studio
-- `auto` — prefers logged-in Codex, then API
-
-```bash
-ais --backend oss --local-provider ollama --model qwen2.5-coder:7b "explain this error"
-```
+| `-p, --prompt` | Prompt to go with piped input |
+| `-a, --agent` | Always turn the request into a command |
+| `-y, --yes` | Run without confirming |
+| `-n, --dry-run` | Show the command, don't run it |
+| `-m, --model` / `-r, --reasoning` | Model and reasoning effort for this run |
+| `-b, --backend` | `auto` · `codex` · `api` (`OPENAI_API_KEY`) · `oss` (Ollama / LM Studio via `--local-provider`) |
+| `--configure` / `--list-models` | Pick defaults / list models |
 
 ## Build
 
-```bash
-go build -o ais ./cmd/ais     # ais.exe on Windows
-./ais --help
+```sh
+go build -o ais ./cmd/ais && go test ./...
 ```
-
-The installer downloads the latest GitHub release, verifies SHA256 checksums, and
-installs to `~/.local/bin` (Linux/macOS) or `%LOCALAPPDATA%\Programs\ais`
-(Windows). Override with `AIS_VERSION`, `AIS_INSTALL_DIR`, or `AIS_BIN_NAME`.
